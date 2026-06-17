@@ -40,6 +40,12 @@ HAZARD_HSV_RANGES = {
 }
 TOKEN_MIN_AREA = 80
 
+# Event detection constants
+LOW_BRIGHTNESS_MEAN_V = 90          # Value channel threshold for low brightness
+LOW_BRIGHTNESS_DARK_PIXEL_FRAC = 0.30
+POLICE_RED_TOKEN_AREA = 100         # area threshold for a visible police red token
+POLICE_EVENT_TIMEOUT = 2.0          # seconds to remain in police event state
+
 # Static-blob suppression: a hazard blob that stays in the same bucket for
 # this many consecutive frames is treated as a fixed road marker / UI
 # element, not a real token, and ignored.
@@ -58,9 +64,14 @@ shared_data = {
     'steering_input': 0.0,
     'acceleration_input': 1.0,
     'lane_index': START_LANE,
+    'lights_on': False,
+    'low_brightness': False,
+    'police_event': False,
 }
 data_lock = threading.Lock()
 is_running = True
+
+police_event_deadline = 0.0
 
 # ---------------------------------------------------------
 # Real-Time Scheduling Framework (Do not change this in your code)
@@ -271,7 +282,37 @@ _static_tracker = StaticBlobTracker()
 # ---------------------------------------------------------
 # Hazard Detection
 # ---------------------------------------------------------
-def find_hazard_direction(frame):
+def detect_low_brightness(frame):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    v = hsv[:, :, 2]
+    dark_pixels = np.count_nonzero(v < LOW_BRIGHTNESS_MEAN_V)
+    return (dark_pixels / v.size) >= LOW_BRIGHTNESS_DARK_PIXEL_FRAC
+
+
+def find_police_red_token(frame):
+    h, w = frame.shape[:2]
+    y_min = int(h * REACT_Y_MIN_FRAC)
+    y_max = int(h * REACT_Y_MAX_FRAC)
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    red_mask = np.zeros((h, w), dtype=np.uint8)
+    for lo, hi in HAZARD_HSV_RANGES['red']:
+        red_mask = cv2.bitwise_or(red_mask, cv2.inRange(hsv, lo, hi))
+
+    zone_mask = np.zeros_like(red_mask)
+    zone_mask[y_min:y_max, :] = red_mask[y_min:y_max, :]
+
+    contours, _ = cv2.findContours(zone_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    for c in contours:
+        if cv2.contourArea(c) < POLICE_RED_TOKEN_AREA:
+            continue
+        boxes.append(cv2.boundingRect(c))
+
+    return boxes
+
+
+def find_hazard_direction(frame, police_mode=False):
     """
     Look for red/yellow tokens in the reaction zone that are in our lane.
     Returns -1 (steer left), +1 (steer right), or 0 (no hazard ahead).
@@ -281,6 +322,15 @@ def find_hazard_direction(frame):
     y_max = int(h * REACT_Y_MAX_FRAC)
     cx = w // 2
     lane_half_width = int(w * LANE_HALF_WIDTH_FRAC)
+
+    if police_mode:
+        red_boxes = find_police_red_token(frame)
+        if red_boxes:
+            closest = min(red_boxes, key=lambda b: b[1] + b[3])
+            token_cx = closest[0] + closest[2] // 2
+            if abs(token_cx - cx) <= lane_half_width:
+                return 0
+            return -1 if token_cx < cx else 1
 
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     hazard_mask = np.zeros((h, w), dtype=np.uint8)
@@ -326,18 +376,31 @@ steer_direction = 0
 steer_deadline = 0.0  # time.time() value at which the current state ends
 
 def processing_task():
-    global steer_state, steer_direction, steer_deadline
+    global steer_state, steer_direction, steer_deadline, police_event_deadline
 
     with data_lock:
         front_frame = shared_data['latest_front_frame']
         lane_index = shared_data['lane_index']
+        lights_on = shared_data['lights_on']
+        police_event = shared_data['police_event']
 
     now = time.time()
     new_steering = 0.0
+    low_brightness = False
+    next_police_event = police_event
+
+    if front_frame is not None:
+        low_brightness = detect_low_brightness(front_frame)
+        red_boxes = find_police_red_token(front_frame)
+        if red_boxes:
+            police_event_deadline = now + POLICE_EVENT_TIMEOUT
+            next_police_event = True
+        elif now >= police_event_deadline:
+            next_police_event = False
 
     if steer_state == 'IDLE':
         if front_frame is not None:
-            direction = find_hazard_direction(front_frame)
+            direction = find_hazard_direction(front_frame, police_mode=next_police_event)
             if direction != 0:
                 target_lane = lane_index + direction
                 if 0 <= target_lane < NUM_LANES:
@@ -362,6 +425,12 @@ def processing_task():
     with data_lock:
         shared_data['steering_input'] = new_steering
         shared_data['acceleration_input'] = 1.0
+        shared_data['low_brightness'] = low_brightness
+        shared_data['police_event'] = next_police_event
+        # If low brightness is detected, we flag headlights requested.
+        # Actual headlight control is not exposed through the current two-float
+        # control protocol, so this is a placeholder for future support.
+        shared_data['lights_on'] = lights_on or low_brightness
 
 def send_controls_task():
     global control_conn
