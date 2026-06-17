@@ -458,6 +458,7 @@ def processing_task():
         shared_data['acceleration_input'] = 1.0
         shared_data['low_brightness'] = low_brightness
         shared_data['police_event'] = next_police_event
+        shared_data['debug_lines'] = debug_lines
         # If low brightness is detected, we flag headlights requested.
         # Actual headlight control is not exposed through the current two-float
         # control protocol, so this is a placeholder for future support.
