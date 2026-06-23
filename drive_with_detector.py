@@ -35,7 +35,7 @@ from rtse_framework import (
     setup_cameras, setup_control_server,
     launch_simulator, run_main_loop, shutdown,
 )
-from detector import detect_and_annotate
+from detector import detect_and_annotate, detect_objects
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Autonomous Control Parameters
@@ -63,6 +63,13 @@ SCORE = {
     'red':    -5.0,   # highest avoidance priority
     'yellow': -3.0,   # avoid
 }
+
+# Rear-camera trailing-car avoidance
+TRAILING_MIN_AREA_FRAC   = 0.004  # ignore tiny red blobs/noise
+TRAILING_CLOSE_Y_FRAC    = 0.58   # close objects appear in the lower rear view
+TRAILING_CLOSE_AREA_FRAC = 0.012  # large enough to be collision-relevant
+TRAILING_MEMORY_SEC      = 0.90   # keep evading through brief detection dropouts
+TRAILING_LANE_PENALTY    = -12.0  # stronger than a close red token penalty
 
 
 def _urgency_weight(y: float) -> float:
@@ -120,6 +127,14 @@ class StaticBlobTracker:
 
 
 _static_tracker = StaticBlobTracker()
+
+# Rear hazard state is owned by the processing task, so it does not need a lock.
+_rear_hazard = {
+    'active_until': 0.0,
+    'lane': None,
+    'bbox': None,
+    'confidence': 0.0,
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Steering State Machine
@@ -185,6 +200,78 @@ def _tick_steering(desired_lane: int) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 # Core Decision Logic
 # ─────────────────────────────────────────────────────────────────────────────
+def _lane_from_x(x_pos: float, frame_w: int) -> int:
+    """Map a camera x-coordinate into the shared LEFT/CENTRE/RIGHT lane model."""
+    road_left = ROAD_LEFT * frame_w / FRAME_W
+    road_right = ROAD_RIGHT * frame_w / FRAME_W
+    lane_w = max(1.0, (road_right - road_left) / 3.0)
+    lane = int((x_pos - road_left) / lane_w)
+    return max(0, min(2, lane))
+
+
+def detect_trailing_car(back_frame):
+    """
+    Detect a collision-relevant rear car and return the lane to avoid.
+
+    The simulator's trailing-car event is satisfied by switching lanes before
+    impact. We use the existing red car detector on the back camera, then keep
+    the hazard alive briefly so steering does not flicker when a frame is missed.
+    """
+    now = time.time()
+
+    if back_frame is not None:
+        results = detect_objects(back_frame)
+        car_bbox = results.get('car')
+
+        if car_bbox is not None:
+            x, y, w, h = car_bbox
+            frame_h, frame_w = back_frame.shape[:2]
+            area_frac = (w * h) / max(1.0, frame_w * frame_h)
+            cy_frac = (y + h / 2) / max(1.0, frame_h)
+            touches_bottom = (y + h) >= frame_h - 4
+
+            is_close = (
+                not touches_bottom
+                and area_frac >= TRAILING_MIN_AREA_FRAC
+                and (cy_frac >= TRAILING_CLOSE_Y_FRAC or area_frac >= TRAILING_CLOSE_AREA_FRAC)
+            )
+
+            if is_close:
+                lane = _lane_from_x(x + w / 2, frame_w)
+                area_score = min(1.0, area_frac / TRAILING_CLOSE_AREA_FRAC)
+                y_score = max(0.0, (cy_frac - TRAILING_CLOSE_Y_FRAC) / (1.0 - TRAILING_CLOSE_Y_FRAC))
+                confidence = min(1.0, 0.7 * area_score + 0.3 * y_score)
+
+                _rear_hazard.update({
+                    'active_until': now + TRAILING_MEMORY_SEC,
+                    'lane': lane,
+                    'bbox': car_bbox,
+                    'confidence': confidence,
+                })
+
+    active = _rear_hazard['lane'] is not None and _rear_hazard['active_until'] > now
+    return {
+        'active': active,
+        'lane': _rear_hazard['lane'] if active else None,
+        'bbox': _rear_hazard['bbox'] if active else None,
+        'confidence': _rear_hazard['confidence'] if active else 0.0,
+    }
+
+
+def apply_rear_hazard(scores: list, desired_lane: int, rear_hazard: dict) -> tuple[int, list]:
+    """Penalize the threatened lane and choose a non-threatened lane while active."""
+    if not rear_hazard['active'] or rear_hazard['lane'] is None:
+        return desired_lane, scores
+
+    scores = scores.copy()
+    blocked_lane = rear_hazard['lane']
+    scores[blocked_lane] += TRAILING_LANE_PENALTY
+
+    candidates = [i for i in range(3) if i != blocked_lane]
+    desired_lane = max(candidates, key=lambda i: scores[i])
+    return desired_lane, scores
+
+
 def decide_lane(tokens: list, frame_w: int) -> tuple[int, list]:
     """
     Score each of three zones (left / centre / right) based on visible tokens.
@@ -226,7 +313,7 @@ def decide_lane(tokens: list, frame_w: int) -> tuple[int, list]:
 # ─────────────────────────────────────────────────────────────────────────────
 # HUD Overlay
 # ─────────────────────────────────────────────────────────────────────────────
-def draw_hud(frame, steer, scores, cur_lane, desired_lane, state, tokens):
+def draw_hud(frame, steer, scores, cur_lane, desired_lane, state, tokens, rear_hazard):
     h, w = frame.shape[:2]
     FONT = cv2.FONT_HERSHEY_SIMPLEX
 
@@ -236,13 +323,20 @@ def draw_hud(frame, steer, scores, cur_lane, desired_lane, state, tokens):
         _SteerState.TAPPING:  (0, 120, 255),
         _SteerState.COOLDOWN: (0, 200, 255),
     }
-    px, py = w - 160, 100
-    cv2.rectangle(frame, (px, py), (w - 4, py + 75), (0, 0, 0), -1)
-    cv2.rectangle(frame, (px, py), (w - 4, py + 75), (80, 80, 80), 1)
+    px, py = w - 170, 100
+    panel_h = 92
+    cv2.rectangle(frame, (px, py), (w - 4, py + panel_h), (0, 0, 0), -1)
+    cv2.rectangle(frame, (px, py), (w - 4, py + panel_h), (80, 80, 80), 1)
+    rear_label = 'CLEAR'
+    rear_color = (140, 220, 140)
+    if rear_hazard['active']:
+        rear_label = 'L C R'.split()[rear_hazard['lane']]
+        rear_color = (0, 120, 255)
     lines = [
         (f"State: {state.upper()}",                        sc.get(state, (180, 180, 180))),
         (f"Steer: {steer:+.1f}",                           (200, 200, 200)),
         (f"Lane:  {'L C R'.split()[cur_lane]}",            (200, 200, 200)),
+        (f"Rear:  {rear_label}",                           rear_color),
         (f"Scores: {scores[0]:+.1f} {scores[1]:+.1f} {scores[2]:+.1f}", (180, 180, 180)),
     ]
     for i, (txt, col) in enumerate(lines):
@@ -290,6 +384,7 @@ def read_back_camera_task():
 def processing_task():
     with data_lock:
         front_frame = shared_data['latest_front_frame']
+        back_frame = shared_data['latest_back_frame']
     if front_frame is None:
         return
 
@@ -301,6 +396,8 @@ def processing_task():
 
     # 3. Decide best lane
     desired_lane, scores = decide_lane(tokens, front_frame.shape[1])
+    rear_hazard = detect_trailing_car(back_frame)
+    desired_lane, scores = apply_rear_hazard(scores, desired_lane, rear_hazard)
 
     # 4. Advance steering state machine
     steer_out = _tick_steering(desired_lane)
@@ -315,7 +412,7 @@ def processing_task():
         cur_lane = _steer['lane']
         state    = _steer['state']
 
-    annotated = draw_hud(annotated, steer_out, scores, cur_lane, desired_lane, state, tokens)
+    annotated = draw_hud(annotated, steer_out, scores, cur_lane, desired_lane, state, tokens, rear_hazard)
     try:
         display_queue.put_nowait(("Autonomous View", cv2.resize(annotated, (640, 480))))
     except Exception:
