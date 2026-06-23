@@ -67,8 +67,6 @@ shared_data = {
     'lights_on': False,
     'low_brightness': False,
     'police_event': False,
-    'debug_overlay': True,
-    'debug_lines': [],
 }
 data_lock = threading.Lock()
 is_running = True
@@ -179,15 +177,6 @@ def setup_control_server():
 # ---------------------------------------------------------
 # Camera Reading
 # ---------------------------------------------------------
-def draw_debug_overlay(frame, lines):
-    y = 20
-    for line in lines:
-        cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                    (0, 255, 255), 1, cv2.LINE_AA)
-        y += 20
-    return frame
-
-
 def read_single_camera(sock, window_name, data_key):
     if sock is None:
         return
@@ -234,19 +223,10 @@ def read_single_camera(sock, window_name, data_key):
             if frame is not None:
                 with data_lock:
                     shared_data[data_key] = frame
-                    debug_overlay = shared_data['debug_overlay']
-                    debug_lines = shared_data['debug_lines']
 
                 frame_resized = cv2.resize(frame, (640, 480))
-                if window_name == 'Front Camera' and debug_overlay:
-                    frame_resized = draw_debug_overlay(frame_resized, debug_lines)
-
                 cv2.imshow(window_name, frame_resized)
-                key = cv2.waitKey(1) & 0xFF
-                if window_name == 'Front Camera' and key in (ord('o'), ord('O')):
-                    with data_lock:
-                        shared_data['debug_overlay'] = not shared_data['debug_overlay']
-                    print(f"Debug overlay {'enabled' if shared_data['debug_overlay'] else 'disabled'}.")
+                cv2.waitKey(1)
             else:
                 cv2.waitKey(1)
 
@@ -420,15 +400,6 @@ def processing_task():
         elif now >= police_event_deadline:
             next_police_event = False
 
-    lights_requested = lights_on or low_brightness
-    debug_lines = [
-        f"DEBUG: {'ON' if shared_data['debug_overlay'] else 'OFF'} (press O)",
-        f"LOW BRIGHTNESS: {'YES' if low_brightness else 'NO'}",
-        f"POLICE EVENT: {'ACTIVE' if next_police_event else 'OFF'}",
-        f"STEER STATE: {steer_state} dir={steer_direction} lane={lane_index}",
-        f"HEADLIGHT REQUEST: {'ON' if lights_requested else 'OFF'}",
-    ]
-
     if steer_state == 'IDLE':
         if front_frame is not None:
             direction = find_hazard_direction(front_frame, police_mode=next_police_event)
@@ -458,7 +429,6 @@ def processing_task():
         shared_data['acceleration_input'] = 1.0
         shared_data['low_brightness'] = low_brightness
         shared_data['police_event'] = next_police_event
-        shared_data['debug_lines'] = debug_lines
         # If low brightness is detected, we flag headlights requested.
         # Actual headlight control is not exposed through the current two-float
         # control protocol, so this is a placeholder for future support.
