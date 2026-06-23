@@ -46,6 +46,12 @@ TOKEN_HSV_RANGES = {
 }
 TOKEN_MIN_AREA = 80
 
+# Event detection constants
+LOW_BRIGHTNESS_MEAN_V = 90          # Value channel threshold for low brightness
+LOW_BRIGHTNESS_DARK_PIXEL_FRAC = 0.30
+POLICE_RED_TOKEN_AREA = 100         # area threshold for a visible police red token
+POLICE_EVENT_TIMEOUT = 2.0          # seconds to remain in police event state
+
 # Static-blob suppression: a hazard blob that stays in the same bucket for
 # this many consecutive frames is treated as a fixed road marker / UI
 # element, not a real token, and ignored.
@@ -68,9 +74,14 @@ shared_data = {
     'steering_input': 0.0,
     'acceleration_input': 1.0,
     'lane_index': START_LANE,
+    'lights_on': False,
+    'low_brightness': False,
+    'police_event': False,
 }
 data_lock = threading.Lock()
 is_running = True
+
+police_event_deadline = 0.0
 
 # Diagnostics are opt-in so normal competition behavior is unchanged.
 # Set RTSE_DIAG = True before running the script to write diag_auto output.
@@ -382,6 +393,8 @@ def read_single_camera(sock, window_name, data_key):
                 frame_resized = cv2.resize(frame, (640, 480))
                 cv2.imshow(window_name, frame_resized)
                 cv2.waitKey(1)
+            else:
+                cv2.waitKey(1)
 
     except Exception:
         pass
@@ -554,12 +567,14 @@ steer_direction = 0
 steer_deadline = 0.0  # time.time() value at which the current state ends
 
 def processing_task():
-    global steer_state, steer_direction, steer_deadline
+    global steer_state, steer_direction, steer_deadline, police_event_deadline
 
     process_start = time.time()
     with data_lock:
         front_frame = shared_data['latest_front_frame']
         lane_index = shared_data['lane_index']
+        lights_on = shared_data['lights_on']
+        police_event = shared_data['police_event']
         frame_timestamp = shared_data['latest_front_frame_timestamp']
         frame_seq = shared_data['latest_front_frame_seq']
 
@@ -574,10 +589,21 @@ def processing_task():
     diag_event = 'heartbeat'
     diag_note = ''
     save_diag_frame = False
+    low_brightness = False
+    next_police_event = police_event
+
+    if front_frame is not None:
+        low_brightness = detect_low_brightness(front_frame)
+        red_boxes = find_police_red_token(front_frame)
+        if red_boxes:
+            police_event_deadline = now + POLICE_EVENT_TIMEOUT
+            next_police_event = True
+        elif now >= police_event_deadline:
+            next_police_event = False
 
     if steer_state == 'IDLE':
         if front_frame is not None:
-            best_lane = find_best_lane(front_frame, lane_index)
+            best_lane = find_best_lane(front_frame, lane_index, police_mode=next_police_event)
             if best_lane != lane_index:
                 direction = 1 if best_lane > lane_index else -1
                 target_lane = lane_index + direction
@@ -614,6 +640,12 @@ def processing_task():
     with data_lock:
         shared_data['steering_input'] = new_steering
         shared_data['acceleration_input'] = 1.0
+        shared_data['low_brightness'] = low_brightness
+        shared_data['police_event'] = next_police_event
+        # If low brightness is detected, we flag headlights requested.
+        # Actual headlight control is not exposed through the current two-float
+        # control protocol, so this is a placeholder for future support.
+        shared_data['lights_on'] = lights_on or low_brightness
         lane_after = shared_data['lane_index']
 
     state_after = steer_state
