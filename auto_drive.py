@@ -20,7 +20,7 @@ CONTROL_HOST = '127.0.0.1'
 CONTROL_PORT = 8081
 
 NUM_LANES = 5
-START_LANE = 2  # assume the car starts centered
+START_LANE = 2  # corrected: middle lane of 0..4 is index 2
 
 # Reaction zone: vertical band (fraction of frame height) where tokens are
 # close enough to react to
@@ -31,8 +31,11 @@ REACT_Y_MAX_FRAC = 0.90
 # of the frame width around the center (one lane's worth of width)
 LANE_HALF_WIDTH_FRAC = 0.10
 
-# Hazard HSV ranges (red wraps around hue 0, so two ranges)
-HAZARD_HSV_RANGES = {
+# Token HSV ranges
+TOKEN_HSV_RANGES = {
+    'green': [
+        (np.array([35, 50, 50]), np.array([85, 255, 255])),
+    ],
     'red': [
         (np.array([0, 120, 70]), np.array([10, 255, 255])),
         (np.array([165, 120, 70]), np.array([180, 255, 255])),
@@ -439,13 +442,12 @@ class StaticBlobTracker:
 _static_tracker = StaticBlobTracker()
 
 # ---------------------------------------------------------
-# Hazard Detection
+# Lane Scoring & Hazard Avoidance
 # ---------------------------------------------------------
-def analyze_hazard(frame, tracker=None):
+def find_best_lane(frame, lane_index):
     """
-    Look for red/yellow tokens in the reaction zone that are in our lane.
-    Returns detector metadata including direction:
-    -1 (steer left), +1 (steer right), or 0 (no hazard ahead).
+    Evaluates all 5 lanes based on green tokens (attraction) and red/yellow tokens (avoidance).
+    Returns the target lane index (0 to 4) that has the highest score and a safe path.
     """
     if tracker is None:
         tracker = _static_tracker
@@ -454,71 +456,95 @@ def analyze_hazard(frame, tracker=None):
     y_min = int(h * REACT_Y_MIN_FRAC)
     y_max = int(h * REACT_Y_MAX_FRAC)
     cx = w // 2
-    lane_half_width = int(w * LANE_HALF_WIDTH_FRAC)
 
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    # 1. Detect red/yellow hazards
     hazard_mask = np.zeros((h, w), dtype=np.uint8)
-    for ranges in HAZARD_HSV_RANGES.values():
-        for lo, hi in ranges:
-            hazard_mask = cv2.bitwise_or(hazard_mask, cv2.inRange(hsv, lo, hi))
+    for ranges in TOKEN_HSV_RANGES['red'] + TOKEN_HSV_RANGES['yellow']:
+        hazard_mask = cv2.bitwise_or(hazard_mask, cv2.inRange(hsv, ranges[0], ranges[1]))
 
-    # Restrict to the reaction zone
-    zone_mask = np.zeros_like(hazard_mask)
-    zone_mask[y_min:y_max, :] = hazard_mask[y_min:y_max, :]
+    # 2. Detect green tokens
+    green_mask = np.zeros((h, w), dtype=np.uint8)
+    for ranges in TOKEN_HSV_RANGES['green']:
+        green_mask = cv2.bitwise_or(green_mask, cv2.inRange(hsv, ranges[0], ranges[1]))
 
-    contours, _ = cv2.findContours(zone_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Crop to reaction zone
+    zone_hazard = np.zeros_like(hazard_mask)
+    zone_hazard[y_min:y_max, :] = hazard_mask[y_min:y_max, :]
 
-    boxes = []
-    for c in contours:
+    zone_green = np.zeros_like(green_mask)
+    zone_green[y_min:y_max, :] = green_mask[y_min:y_max, :]
+
+    # Find hazard boxes
+    contours_hazard, _ = cv2.findContours(zone_hazard, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    hazard_boxes = []
+    for c in contours_hazard:
         if cv2.contourArea(c) < TOKEN_MIN_AREA:
             continue
-        boxes.append(cv2.boundingRect(c))
+        hazard_boxes.append(cv2.boundingRect(c))
 
-    boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
-    real_boxes, suppressed_boxes, static_counts = tracker.filter_real(boxes, return_debug=True)
+    # Apply static blob suppression to hazards
+    hazard_boxes = _static_tracker.filter_real(hazard_boxes)
 
-    in_lane = False
-    token_cx = cx
-    in_lane_box = None
-    for (x, y, bw, bh) in real_boxes:
+    # Find green token boxes
+    contours_green, _ = cv2.findContours(zone_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    green_boxes = []
+    for c in contours_green:
+        if cv2.contourArea(c) < TOKEN_MIN_AREA:
+            continue
+        green_boxes.append(cv2.boundingRect(c))
+
+    # Initialize lane scores (0..4)
+    scores = [0.0, 0.0, 0.0, 0.0, 0.0]
+    
+    # Apply lane preferences: prefer current lane and prefer center of the road
+    for l in range(5):
+        scores[l] += -0.1 * abs(l - lane_index)
+        scores[l] += -0.05 * abs(l - 2)
+
+    # Map hazards to lanes and penalize
+    # Lane width is approximately 96 pixels.
+    # relative lane = round((bcx - 320) / 96.0)
+    for (x, y, bw, bh) in hazard_boxes:
         bcx = x + bw // 2
-        if abs(bcx - cx) <= lane_half_width:
-            in_lane = True
-            token_cx = bcx
-            in_lane_box = (x, y, bw, bh)
-            break
+        rel_lane = int(round((bcx - cx) / 96.0))
+        abs_lane = lane_index + rel_lane
+        if 0 <= abs_lane < 5:
+            scores[abs_lane] -= 100.0
 
-    if not in_lane:
-        direction = 0
-    else:
-        # Token is in our lane: dodge away from its exact position.
-        # If it's left-of-center (or dead center), go right; otherwise go left.
-        direction = 1 if token_cx <= cx else -1
+    # Map green tokens to lanes and reward
+    for (x, y, bw, bh) in green_boxes:
+        bcx = x + bw // 2
+        rel_lane = int(round((bcx - cx) / 96.0))
+        abs_lane = lane_index + rel_lane
+        if 0 <= abs_lane < 5:
+            scores[abs_lane] += 15.0
 
-    return {
-        'direction': direction,
-        'shape': (h, w),
-        'y_min': y_min,
-        'y_max': y_max,
-        'cx': cx,
-        'lane_half_width': lane_half_width,
-        'hazard_mask_pixels': int(cv2.countNonZero(hazard_mask)),
-        'zone_mask_pixels': int(cv2.countNonZero(zone_mask)),
-        'raw_boxes': boxes,
-        'real_boxes': real_boxes,
-        'suppressed_boxes': suppressed_boxes,
-        'static_counts': static_counts,
-        'in_lane_box': in_lane_box,
-        'token_cx': token_cx if in_lane else None,
-    }
+    # Path safety evaluation: find the best lane
+    best_lane = lane_index
+    max_score = -999999.0
 
+    for l in range(5):
+        # Determine if there is a safe path to lane l
+        # The path to lane l is safe if all lanes we must switch into are free of hazards (score > -50)
+        path_safe = True
+        step = 1 if l > lane_index else -1
+        # Check intermediate lanes (excluding current, including target l)
+        for check_l in range(lane_index + step, l + step, step):
+            if check_l < 0 or check_l >= 5:
+                path_safe = False
+                break
+            if scores[check_l] < -50.0:
+                path_safe = False
+                break
 
-def find_hazard_direction(frame):
-    """
-    Look for red/yellow tokens in the reaction zone that are in our lane.
-    Returns -1 (steer left), +1 (steer right), or 0 (no hazard ahead).
-    """
-    return analyze_hazard(frame)['direction']
+        if path_safe:
+            if scores[l] > max_score:
+                max_score = scores[l]
+                best_lane = l
+
+    return best_lane
 
 # ---------------------------------------------------------
 # Steering State Machine
@@ -551,9 +577,9 @@ def processing_task():
 
     if steer_state == 'IDLE':
         if front_frame is not None:
-            analysis = analyze_hazard(front_frame)
-            direction = analysis['direction']
-            if direction != 0:
+            best_lane = find_best_lane(front_frame, lane_index)
+            if best_lane != lane_index:
+                direction = 1 if best_lane > lane_index else -1
                 target_lane = lane_index + direction
                 if 0 <= target_lane < NUM_LANES:
                     steer_direction = direction
@@ -574,8 +600,7 @@ def processing_task():
         new_steering = float(steer_direction)
         if now >= steer_deadline:
             with data_lock:
-                shared_data['lane_index'] += steer_direction
-                lane_after = shared_data['lane_index']
+                shared_data['lane_index'] = max(0, min(4, shared_data['lane_index'] + steer_direction))
             steer_state = 'COOLDOWN'
             steer_deadline = now + COOLDOWN_DURATION
             diag_event = 'tap_end'
